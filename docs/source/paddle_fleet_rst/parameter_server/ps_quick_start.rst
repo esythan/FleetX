@@ -16,7 +16,7 @@ Speech
 -  **异步训练**\ ：与同步训练不同，在异步训练中任何两个Worker之间的参数更新都互不影响。每一个Worker完成训练、上传梯度后，Server都会立即更新参数并将结果返回至相应的训练节点。拿到最新的参数后，该训练节点会立即开始新一轮的训练。异步训练去除了训练过程中的等待机制，训练速度得到了极大的提升，但是缺点也很明显，那就是Loss下降不稳定，容易发生抖动。建议在个性化推荐（召回、排序）、语义匹配等数据量大的场景使用。
 -  **GEO异步训练**\ ：GEO异步训练是飞桨独有的一种异步训练模式，训练过程中任何两个训练节点之间的参数更新同样都互不影响，但是每个训练节点本地都会拥有完整的训练流程，即前向计算、反向计算和参数优化，而且每训练到一定的批次(Batch) 训练节点都会将本地的参数计算一次差值(Step间隔带来的参数差值)，将差值发送给服务端累计更新，并拿到最新的参数后，该训练节点会立即开始新一轮的训练。所以显而易见，在GEO异步训练模式下，Worker不用再等待Server发来新的参数即可执行训练，在训练效果和训练速度上有了极大的提升。但是此模式比较适合可以在单机内能完整保存的模型，在搜索、NLP等类型的业务上应用广泛，比较推荐在词向量、语义匹配等场景中使用。
 
-本节将采用推荐领域非常经典的模型wide_and_deep为例，介绍如何使用Fleet API（paddle.distributed.fleet）完成参数服务器训练任务，本次快速开始的示例代码位于https://github.com/PaddlePaddle/FleetX/tree/develop/examples/wide_and_deep。
+本节将采用推荐领域非常经典的模型wide_and_deep为例，介绍如何使用Fleet API（paddle.distributed.fleet）完成参数服务器训练任务，本次快速开始的示例代码位于https://github.com/PaddlePaddle/FleetX/tree/develop/examples/wide_and_deep_dataset。
 
 
 版本要求
@@ -27,10 +27,15 @@ Speech
 操作方法
 --------
 参数服务器训练的基本代码主要包括如下几个部分：
+
 1. 导入分布式训练需要的依赖包。
+
 2. 定义分布式模式并初始化分布式训练环境。
+
 3. 加载模型及数据。
+
 4. 定义参数更新策略及优化器。
+
 5. 开始训练。
 
 下面将逐一进行讲解。
@@ -62,19 +67,36 @@ Speech
     fleet.init(role)
 
 
-加载模型及数据
+构建模型
 ~~~~~~~~~~~~~~
 
 .. code:: python
 
-    # 模型定义参考examples/wide_and_deep中model.py
-    from model import net
-    from reader import data_reader
+    # 模型定义参考examples/wide_and_deep_dataset中model.py
+    from model import WideDeepModel
 
-    feeds, predict, avg_cost = net()
+    # 构建模型
+    model = WideDeepModel()
+    model.net(is_train=True)
 
-    train_reader = paddle.batch(data_reader(), batch_size=4)
-    reader.decorate_sample_list_generator(train_reader)
+构建dataset加载数据
+~~~~~~~~~~~~~~~~~~
+
+.. code:: python
+    
+    # 具体数据处理参考examples/wide_and_deep_dataset中reader.py
+    dataset = paddle.distributed.QueueDataset()
+    thread_num = 1
+    dataset.init(use_var=model.inputs, 
+                 pipe_command="python reader.py", 
+                 batch_size=batch_size, 
+                 thread_num=thread_num)
+
+    train_files_list = [os.path.join(train_data_path, x)
+                          for x in os.listdir(train_data_path)]
+    dataset.set_filelist(train_files_list)
+
+备注：dataset具体用法参见\ `使用InMemoryDataset/QueueDataset进行训练 <https://fleet-x.readthedocs.io/en/latest/paddle_fleet_rst/parameter_server/performance/dataset.html>`_\。
 
 
 定义同步训练 Strategy 及 Optimizer
@@ -113,7 +135,7 @@ API中，用户可以使用\ ``fleet.DistributedStrategy()``\ 接口定义自己
 对于服务器节点，首先用\ ``init_server()``\ 接口对其进行初始化，然后启动服务并开始监听由训练节点传来的梯度。
 
 同样对于训练节点，用\ ``init_worker()``\ 接口进行初始化后，
-开始执行训练任务。运行\ ``exe.run()``\ 接口开始训练，并得到训练中每一步的损失值。
+开始执行训练任务。运行\ ``exe.train_from_dataset()``\ 接口开始训练。
 
 .. code:: python
 
@@ -127,26 +149,25 @@ API中，用户可以使用\ ``fleet.DistributedStrategy()``\ 接口定义自己
         fleet.init_worker()
 
         for epoch_id in range(1):
-            reader.start()
-            try:
-                while True:
-                    loss_val = exe.run(program=paddle.static.default_main_program(),
-                                       fetch_list=[avg_cost.name])
-                    loss_val = np.mean(loss_val)
-                    print("TRAIN ---> pass: {} loss: {}\n".format(epoch_id,
-                                                                  loss_val))
-            except paddle.core.EOFException:
-                reader.reset()
+            exe.train_from_dataset(paddle.static.default_main_program(),
+                                   dataset,
+                                   paddle.static.global_scope(), 
+                                   debug=False, 
+                                   fetch_list=[train_model.cost],
+                                   fetch_info=["loss"],
+                                   print_period=1)
     
         fleet.stop_worker()
+
+备注：Paddle2.3版本及以后，ParameterServer训练将废弃掉dataloader + exe.run()方式，请切换到dataset + exe.train_from_dataset()方式。
 
 
 运行训练脚本
 ~~~~~~~~~~~~
 
-定义完训练脚本后，我们就可以用\ ``paddle.distributed.launch``\ 模块运行分布式任务了。其中\ ``server_num``\ ,
-``worker_num``\ 分别为服务节点和训练节点的数量。在本例中，服务节点有1个，训练节点有两个。
+定义完训练脚本后，我们就可以用\ ``fleetrun``\ 运行分布式任务了。其中\ ``server_num``\ ,
+``trainer_num``\ 分别为服务节点和训练节点的数量。在本例中，服务节点有1个，训练节点有两个。
 
 .. code:: sh
 
-    python -m paddle.distributed.launch --server_num=1 --worker_num=2 train.py
+    fleetrun --server_num=1 --trainer_num=2 train.py

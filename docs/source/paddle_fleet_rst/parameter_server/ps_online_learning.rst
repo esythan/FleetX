@@ -5,6 +5,8 @@
 ---------------------
 飞桨参数服务器训练支持流式训练模式，支持配置千亿级大规模稀疏及[0, INT64]范围内的ID映射，支持模型自增长及配置特征准入（不存在的特征可以以适当的条件创建）、淘汰（够以一定的策略进行过期的特征的清理）等策略，支持模型增量保存，通过多种优化来保证流式训练的流程及效果。
 
+本章节只介绍流式训练需要的重点API和配置，具体流式训练示例请参考PaddleRec中的\ `流式训练 <https://github.com/PaddlePaddle/PaddleRec/blob/master/doc/online_trainer.md>`_\内容。
+
 
 原理介绍
 ---------------------
@@ -30,19 +32,19 @@
 
 .. py:function:: paddle.static.nn.sparse_embedding(input, size, padding_idx=None, is_test=False, entry=None, param_attr=None, dtype='float32')
 
-飞桨参数服务器模式使用大规模稀疏需要使用`paddle.static.nn.sparse_embedding`作为embedding lookup层的算子， 而不是使用 `paddle.nn.functional.embedding`。
-`paddle.static.nn.sparse_embedding` 采用稀疏模式进行梯度的计算和更新，支持配置训练模式(训练/预测)，支持配置准入策略，且输入接受[0, INT64]范围内的特征ID,  更加符合在线学习的功能需求。
+飞桨参数服务器模式使用使用`paddle.static.nn.sparse_embedding`作为embedding lookup层的算子， 而不是使用 `paddle.nn.functional.embedding`。
+`paddle.static.nn.sparse_embedding` 采用稀疏模式进行梯度的计算和更新，输入接受[0, INT64]范围内的特征ID,  更加符合在线学习的功能需求。
 
 
 **参数：**
 
     - input, (Tensor): 存储特征ID的Tensor，数据类型必须为：int32/int64，特征的范围在[0, INT64]之间，超过范围在运行时会提示错误。
     - size, (list|tuple): 形状为(num_embeddings, embedding_dim), 大规模稀疏场景下， 参数规模初始为0，会随着训练的进行逐步扩展，因此num_embeddings 暂时无用，可以随意填一个整数，embedding_dim 则为词嵌入权重参数的维度配置。
-    - padding_idx, (int)，如果配置了padding_idx，那么在训练过程中遇>到此id时会被用0填充。
-    - is_test, (bool)，训练/预测模式，在预测模式(is_test=False)下，遇到不存在的特征，不会初始化及创建，直接以0填充后返回。
-    - entry, (ProbabilityEntry|CountFilterEntry, optinal)，准入策略配置，目前支持概率准入和频次准入。
-    - param_attr, (ParamAttr, optinal)，embedding层参数属性，类型是ParamAttr或者None， 默认为None。
-    - dtype, (float32|float64, optinal)，输出Tensor的数据类型，支持float32、float64。当该参数值为None时， 输出Tensor的数据类型为float32。默认值为None。
+    - padding_idx, (int): 如果配置了padding_idx，那么在训练过程中遇>到此id时会被用0填充。
+    - is_test, (bool): 训练/预测模式，在预测模式(is_test=False)下，遇到不存在的特征，不会初始化及创建，直接以0填充后返回。
+    - entry, (ShowClickEntry, optinal): 准入策略配置，支持用户自定义传入稀疏特征的展现(show)和点击(click)次数，稀疏参数的embedding会有两个维度统计特征的总展现和总点击量，用于稀疏参数的准入、淘汰、保存等。
+    - param_attr, (ParamAttr, optinal): embedding层参数属性，类型是ParamAttr或者None， 默认为None。
+    - dtype, (float32|float64, optinal): 输出Tensor的数据类型，支持float32、float64。当该参数值为None时， 输出Tensor的数据类型为float32。默认值为None。
 
 **用法示例：**
 
@@ -56,7 +58,14 @@
         embedding_size = 64
 
         # 训练过程中，出现超过10次及以上的特征才会参与训练
-        entry = paddle.distributed.CountFilterEntry(10)
+        # 构造ShowClickEntry，指明展现和点击对应的变量名
+        entry = paddle.distributed.ShowClickEntry("show", "click")
+
+        # 构造show/click对应的data，变量名需要与entry中的名称一致
+        show = paddle.static.data(
+            name="show", shape=[None, 1], dtype="int64")
+        label = paddle.static.data(
+            name="click", shape=[None, 1], dtype="int64")
 
         input = paddle.static.data(name='ins', shape=[1], dtype='int64')
 
@@ -68,18 +77,23 @@
             param_attr=paddle.ParamAttr(name="SparseFeatFactors",
                     initializer=paddle.nn.initializer.Uniform()))
 
+飞桨参数服务器模式下的稀疏参数，存储于PServer端的SparseTable中，并使用Accessor对SparseTable中的参数进行更新、保存、淘汰等。
 
-淘汰配置
-~~~~~~~~~
+用户可以通过对Accessor进行配置来影响稀疏参数的各种功能：
 
-.. py:function:: paddle.distributed.fleet.shrink(threshold)
+配置说明参见PaddleRec中的\ `流式训练 <https://github.com/PaddlePaddle/PaddleRec/blob/master/doc/online_trainer.md>`_\中的高级功能章节。
 
-使用此接口，可以按照一定的频率进行过期ID特征的清理，稀疏参数在初始化的时候，会在内部设定一个最近出现时间戳的记录(相对值计数，非timestamp)，当特征ID在训练中出现时，此值被置位0，当用户显示调用`paddle.distributed.fleet.shrink(threshold)`是，此值会主动递增1，当值超过`threshold`时，则会被清理掉。
+具体配置内容参加PaddleRec的slot_dnn模型示例的\ `config_online.yaml <https://github.com/PaddlePaddle/PaddleRec/blob/master/models/rank/slot_dnn/config_online.yaml>`_\的table_parameters部分。
 
+稀疏参数淘汰
+~~~~~~~~~~
 
-**参数：**
+.. py:function:: paddle.distributed.fleet.shrink()
 
-    - threshold, (int): 对于超过一定时间未出现的特征进行清理。
+使用此接口，可以对长久不出现或者出现频率极低的ID特征进行清理。
+稀疏参数在初始化的时候，会在内部设定一个unseen_day，记录该ID未出现的天数，当值超过Accessor配置中的`delete_after_unseen_days`时，则会被清理掉。
+同时，Accessor会利用SparseTable中保存的稀疏参数统计量（show/click）计算特征的频次score，当该score值小于Accessor配置中的`delete_threshold`时，也会被清理掉。
+
 
     .. code:: python
 
@@ -92,29 +106,19 @@
 
         do_training ...
 
-        # 天级别的淘汰，每天的数据训练结束后，对所有特征的过期时间+1，对超过30天未出现的特征进行清理
-        unseen_days = 30
-
+        # 天级别的淘汰，每天的数据训练结束后，对长久不出现或者出现频率极低的ID特征进行清理
         if fleet.is_first_worker() and hour == 23:
-            paddle.distributed.fleet.shrink(unseen_days)
+            paddle.distributed.fleet.shrink()
 
 
 
 保存及增量保存配置
 ~~~~~~~~~~~~~~~~~~~~~
+具体API接口参考\ `增量训练 <https://fleet-x.readthedocs.io/en/latest/paddle_fleet_rst/parameter_server/ps_incremental_learning.html>`_\保存模型相关部分。
+一般在流式训练中，会保存两种类型的模型：
 
-.. py:function:: paddle.distributed.fleet.save_persistables(exe, dirname, mode)
-
-模型保存接口，使用该接口会将当前训练中涉及到的模型权重，优化器的中间值全量保存下来，供增量训练、恢复训练、在线预测使用。
-针对大规模稀疏，会提供对应的save_base、save_delta等增量保存方案，降低模型保存的磁盘占用及耗时。
-
-
-**参数：**
-
-    - executor, (Executor): 用于保存持久性变量的 ``executor``。
-    - dirname, (str): 用于储存持久性变量的文件目录。`
-    - mode, (0|1|2, optinal)，仅支持 `0、1、2` 三个数值的配置，`0` 表示全量保存，`1` 表示保存base模型， `2`表示保存增量模型。
-
+- checkpoint模型，用于在训练异常中断后，全量加载模型并继续增量训练，由于该模型占用存储过大，一般保存频率较低。
+- inference模型，用于线上部署，base+delta模型，base模型一般每天保存一次，然后以base模型为基础，每隔一段时间保存一个delta模型。
 
     .. code:: python
 
@@ -127,23 +131,31 @@
 
         do_training ...
 
-        # 天级别的淘汰，每天的数据训练结束后，对所有特征的过期时间+1，对超过30天未出现的特征进行清理
-        unseen_days = 30
+        save_delta_freq = 1    # 保存delta模型的频率
+        save_checkpoint_freq = 2   # 保存checkpoint模型的频率
 
         if fleet.is_first_worker() and hour == 0:
-            # 每天的0点，保存一次全量模型
+            # 每天的0点，保存一次checkpoint模型和base模型
             if hour == 0:
-                fleet.save_persistables(exe, "output/epoch_{}".format(day), 1)
+                # 保存checkpoint模型
+                fleet.save_persistables(exe, model_path, mode=0)
+                # 保存base模型
+                fleet.save_inference_model(exe, model_path, feed_var_names, target_vars, mode=2)
 
-            # 其他时间点，每个小时保存一次增量模型
             else:
-                fleet.save_persistables(exe, "output/epoch_{}".format(day), 2)
+                if hour % save_delta_freq == 0:
+                    # 每一小时保存一个delta模型
+                    fleet.save_inference_model(exe, model_path, feed_var_names, target_vars, mode=1)
+                if hour % save_checkpoint_freq == 0:
+                    # 每两小时保存一个checkpoint模型
+                    fleet.save_persistables(exe, model_path, mode=0)
 
 
 常规训练流程
 ~~~~~~~~~~~~~~~~~~~~~
 
-流式训练是个上下游牵涉众多的训练方法，本文只贴出训练相关的配置给用户做一个讲解，具体使用需要结合实际情况进行代码的伪代码：
+流式训练是个上下游牵涉众多的训练方法，本文只贴出训练相关的配置给用户做一个讲解。
+完整的流式训练示例可参考\ `流式训练脚本 <https://github.com/PaddlePaddle/PaddleRec/blob/master/tools/static_ps_online_trainer.py>`_\，并结合自己的业务需求进行修改。
 
 .. code-block:: python
 
@@ -173,7 +185,6 @@
         fleet.init_worker()
 
         while True:
-
             # 持续不断的从`get_ready_training_set`获取可训练的书记集和相关的配置
             # 下面是一个按小时训练的例子
             dataset, hour, day = get_ready_training_dataset()
@@ -188,18 +199,25 @@
                                    fetch_info=["avg_auc"],
                                    print_period=10)
 
-            # 0号保存模型即可，每天第0个小时进行全量保存， 剩余时间进行增量保存
-            if fleet.is_first_worker():
-                unseen_days = 30
+            if hour == 23:
+                paddle.distributed.fleet.shrink()
 
-                if hour == 23:
-                    paddle.distributed.fleet.shrink(unseen_days)
-
+            if fleet.is_first_worker() and hour == 0:
+                # 每天的0点，保存一次checkpoint模型和base模型
                 if hour == 0:
-                    fleet.save_persistables(exe, "output/epoch_{}".format(day), 1)
-                else:
-                    fleet.save_persistables(exe, "output/epoch_{}".format(day), 2)
+                    # 保存checkpoint模型
+                    fleet.save_persistables(exe, model_path, mode=0)
+                    # 保存base模型
+                    fleet.save_inference_model(exe, model_path, feed_var_names, target_vars, mode=2)
 
+                else:
+                    if hour % save_delta_freq == 0:
+                        # 每一小时保存一个delta模型
+                        fleet.save_inference_model(exe, model_path, feed_var_names, target_vars, mode=1)
+                    if hour % save_checkpoint_freq == 0:
+                        # 每两小时保存一个checkpoint模型
+                        fleet.save_persistables(exe, model_path, mode=0)
+            fleet.barrier_worker()
         fleet.stop_worker()
 
 

@@ -11,18 +11,113 @@
 
 原理介绍
 ---------------------
+飞桨模型参数在参数服务器下分为稠密参数和稀疏参数两种，训练节点分为PServer和Worker两种，每个Worker上都有完整的稠密参数，没有稀疏参数。稀疏参数和稠密参数分布于全部的PServer节点上。
 
-飞桨参数服务器增量训练包含两部分内容，即模型保存和模型加载。训练节点分为PServer和Worker两种，每个Worker上都有完整的稠密参数，没有稀疏参数。稀疏参数和稠密参数分布于全部的PServer节点上。
+飞桨参数服务器增量训练包含两部分内容，即模型保存和模型加载。其中保存的模型分为以下两种类型：
+
+- checkpoint模型，包含全部模型参数及优化器状态，可在PServer端全量保存和加载。
+- inference模型，稀疏参数通过PServer保存和加载，包括稠密参数及优化器状态；稠密参数通过0号Worker保存和加载，仅有稠密参数而无优化器状态（产出二进制文件）。
+
+通常情况下，增量训练基于checkpoint模型，inference模型用于线上部署，飞桨参数服务器提供了非常方便的API来保存和加载这两种类型的模型。
+
+功能效果
+---------------------
+- 训练开始时，实现模型参数的全量加载。
+- 训练结束时，实现模型参数的全量保存。
+
+使用方法
+---------------------
+
+保存checkpoint模型
+~~~~~~~~~~~~~~~~~
+.. py:function:: paddle.distributed.fleet.save_persistables(executor, dirname, main_program=None, mode=0)
+飞桨参数服务器模式使用`paddle.distributed.fleet.save_persistables`保存全量的checkpoint模型，包括全部的稀疏参数和稠密参数，在PServer端以分片方式保存
+
+**参数：**
+    - executor (Executor): 用于保存模型的executor。
+    - dirname (string): 模型的保存路径。
+    - main_program (Program): 模型的Program。
+    - mode (int): 保存模式，其中0为全量模型。
+
+**用法示例：**
+
+    .. code:: python
+
+        ...
+
+        import paddle.distributed.fleet as fleet
+
+        dirname = "/you/path/to/model"
+    
+        if fleet.is_first_worker():
+            fleet.save_persistables(exe, dirname, mode=0)
+    
+    
+
+保存inference模型
+~~~~~~~~~~~~~~~~
+.. py:function:: paddle.distributed.fleet.inference_model(executor, dirname, feeded_var_names, target_vars, main_program=None, mode=0)
+飞桨参数服务器模式使用`paddle.distributed.fleet.save_inference_model`保存用于线上部署的模型。
+
+该模型包括三部分：
+
+- 稀疏参数：在PServer端以分片方式保存
+- 稠密参数：在0号Worker上保存成线上服务可以加载的二进制文件
+- 模型文件：在0号Worker上保存裁剪之后的模型
+
+**参数：**
+    - executor (Executor): 用于保存模型的executor。
+    - dirname (string): 模型的保存路径。
+    - feeded_var_names (list of string): 模型输入var_name，用于模型裁剪
+    - target_vars (list of tensor): 模型输出var，用于模型裁剪
+    - main_program (Program): 模型的Program。
+    - mode (int): 保存模式，其中1为delta模型，2为base模型，在稀疏参数拥有准入配置的情况下，可能会丢一部分未被准入的特征。
+
+**用法示例：**
+
+    .. code:: python
+
+        ...
+
+        import paddle.distributed.fleet as fleet
+
+        dirname = "/you/path/to/model"
+    
+        if fleet.is_first_worker():
+            fleet.save_inference_model(exe,
+                                       dirname, 
+                                       [feed.name for feed in feed_vars],
+                                       target_vars,
+                                       mode=1)
+
+模型加载
+~~~~~~~
+.. py:function:: paddle.distributed.fleet.load_model(path, mode)
+飞桨参数服务器模式使用`paddle.distributed.fleet.load_model`加载模型。
+**参数：**
+    - path (string): 模型的保存路径。
+    - mode (int): 加载模式，其中0为checkpoint模型，1为delta模型，2为base模型。
+**用法示例：**
+
+    .. code:: python
+
+        ...
+
+        import paddle.distributed.fleet as fleet
+
+        dirname = "/you/path/to/model"
+    
+        if fleet.is_first_worker():
+            fleet.load_model(dirname, mode=0)
 
 
-飞桨模型参数在参数服务器下分为稠密参数和稀疏参数两种， 在调用模型保存的接口后，会分别在PServer端和0号Worker端进行参数的保存，其中0号Worker端将保存全部的稠密参数及相关的状态，每个PServer将以分片的形式保存位于该PServer端的稀疏参数。 
+load_model()接口可以同时加载全部的稀疏参数和稠密参数，支持checkpoint模型和inference模型。
 
-
-飞桨模型参数在参数服务器下分为稠密参数和稀疏参数两种， 需要分别在PServer端和0号Worker端进行加载才能完成对参数的加载。 
+另外，飞桨参数服务器还提供了另外一种加载模型的方式，针对inference模型，分别加载稀疏参数和稠密参数，并且可以指定需要加载的参数。
 
 训练启动时每个PServer的基本初始流程如下：
 
-- 每个节点执行 `fleet.init_server(dirname=None, var_names=None, **kwargs)` 进行PServer端初始化，分配到此节点的稠密参数会按照定义的形状和初始化方法进行初始化， 稀疏参数则只预定义出初始化方法，稀疏参数会在训练过程中根据前向通信算子发送过来的ID进行实时初始化。 init_server用有两个选配参数，分别是 `dirname`和`var_names`,`dirname`表示需要增量加载的模型路径，两个选配参数相互配合实现稀疏参数的加载，注意, 如果只指定 `dirname`， 则表示会从指定的目录中加载全部的稀疏参数， 如果还指定了`var_names`，则表示加载指定参数名的稀疏参数。 注意，`init_server` 只会加载稀疏参数，稠密参数的加载在Worker端进行。
+- 每个节点执行 `fleet.init_server(dirname=None, var_names=None, **kwargs)` 进行PServer端初始化。 init_server用有两个选配参数，分别是 `dirname`和`var_names`,`dirname`表示需要增量加载的模型路径，`var_names`指定需要加载的稀疏参数名。 注意，`init_server` 只会加载稀疏参数，稠密参数的加载在Worker端进行。
 - 每个节点执行 `fleet.run_server()` 表明当前节点已经初始化成功，可以支持Worker端的连接和通信。
 
 
@@ -31,37 +126,6 @@
 - 每个节点执行 `exe.run(paddle.static.default_startup_program())` 进行参数初始化。
 - 0号节点执行 `paddle.static.load_vars()` 指定要加载的稠密参数的名字列表和模型目录，将稠密参数通过此方式进行加载。
 - 每个节点执行 `fleet.init_worker()` ， 其中0号节点的稠密参数将同步给相应的PServer，其他节点(非0号)会从PServer端将稠密参数取回本地赋值给本地的稠密参数。
-
-
-至此，完成了整个训练开始前，PServer和Worker中稠密参数和稀疏参数的加载和同步。
-
-
-
-功能效果
----------------------
-- 训练开始时，使用上述方法，可实现模型参数的全量加载。
-- 训练结束是，使用上述方法，可实现模型参数的全量保存。
-
-
-使用方法
----------------------
-
-模型保存：
-
-.. code-block:: python
-
-    # 在需要保存模型的地方，执行下面的命令，即可完成模型中全量参数的保存
-    # 其中， 稠密参数会被保存在0号Worker上， 稀疏参数会被保存在每个PServer上的同名路径下
-    
-    dirname = "/you/path/to/model"
-    
-    if fleet.is_first_worker():
-        fleet.save_persistables(dirname)
-
-
-模型加载(文章末尾附录了获取稀疏/稠密参数的代码，参考或复制使用)：
-
-**对于流式训练，模型加载需要使用全量保存的模型(fleet.save_persistable, 配置mode=0)，如果使用增量保存(Base+Detla)的方式，在拥有准入配置的情况下，可能会丢一部分未被准入的特征。**
 
 .. code-block:: python
 
@@ -82,26 +146,27 @@
         paddle.static.load_vars(executor=exe, dirname=path, vars=dense_vars)
         fleet.init_worker()
 
+备注：文章末尾附录了获取稀疏/稠密参数的代码，参考或复制使用。
 
 运行成功提示
 ---------------------
 
 1. 模型加载当前并没有提示
-2. 模型保存成功，会在相应的目录保存下模型文件， 稀疏参数会被保存在每个PServer上的同名路径下。
+2. 模型保存成功，会在相应的目录保存下模型文件。
 
 
 常见问题与注意事项
 ---------------------
 
 - 节点动态调整
- + 训练节点在发生变化的情况下， 稀疏参数需要做一次重新分布分布以满足新的加载需求。
- + 当前框架并没有提供此稀疏参数重分布脚本，目前需要用户自行编写。
+ + 训练节点在发生变化的情况下，只要稀疏参数的分片数不发生改变（shard_num默认为1000），则可以成功加载模型。
 
 - 加载指定稠密参数
  + 用户可以选择性的加载所需的稠密参数，具体是在 0号 Worker 执行 `paddle.static.load_vars`时 ，指定的 vars的列表来控制。
 
 - 加载指定稀疏参数
  + 用户可以选择性的加载指定的稀疏参数，具体是在PServer执行`init_server`时，指定`var_names`的列表，通过此列表来控制加载的参数名单。
+
 
 
 论文/引用
